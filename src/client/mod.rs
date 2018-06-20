@@ -640,7 +640,7 @@ pub struct Builder {
     exec: Exec,
     keep_alive: bool,
     keep_alive_timeout: Option<Duration>,
-    idle_connection_max: Option<usize>,
+    max_idle_connections: Option<usize>,
     h1_writev: bool,
     h1_title_case_headers: bool,
     //TODO: make use of max_idle config
@@ -656,7 +656,7 @@ impl Default for Builder {
             exec: Exec::Default,
             keep_alive: true,
             keep_alive_timeout: Some(Duration::from_secs(90)),
-            idle_connection_max: None,
+            max_idle_connections: None,
             h1_writev: true,
             h1_title_case_headers: false,
             max_idle: 5,
@@ -697,8 +697,8 @@ impl Builder {
     ///
     /// Default is 'None'
     #[inline]
-    pub fn idle_connection_max<D>(&mut self, val: Option<usize>) -> &mut Self {
-        self.idle_connection_max = val;
+    pub fn max_idle_connections<D>(&mut self, val: Option<usize>) -> &mut Self {
+        self.max_idle_connections = val;
         self
     }
 
@@ -810,7 +810,7 @@ impl Builder {
             pool: Pool::new(
                 self.keep_alive,
                 self.keep_alive_timeout,
-                self.idle_connection_max,
+                self.max_idle_connections,
                 &self.exec
             ),
             retry_canceled_requests: self.retry_canceled_requests,
