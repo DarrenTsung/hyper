@@ -691,7 +691,10 @@ impl Builder {
         self
     }
 
-    /// Set an optional maximum for idle sockets being kept-alive.
+    /// Set an optional maximum for connections. Requests beyond this limit
+    /// will wait for an re-usable connection, failing if no re-usable connection
+    /// will exist (no active connections for the same Key).
+    ///
     /// This is local to the client and will not synchronize across
     /// multiple clients.
     ///
