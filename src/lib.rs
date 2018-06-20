@@ -23,6 +23,7 @@ extern crate httparse;
 extern crate iovec;
 #[macro_use] extern crate log;
 #[cfg(feature = "runtime")] extern crate net2;
+extern crate raii_counter;
 extern crate time;
 #[cfg(feature = "runtime")] extern crate tokio;
 #[cfg(feature = "runtime")] extern crate tokio_executor;

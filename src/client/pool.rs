@@ -7,6 +7,7 @@ use std::error::Error;
 
 use futures::{Future, Async, Poll};
 use futures::sync::oneshot;
+use raii_counter::{Counter, WeakCounter};
 #[cfg(feature = "runtime")]
 use tokio_timer::Interval;
 
@@ -61,11 +62,12 @@ struct Connections<T> {
     // These are internal Conns sitting in the event loop in the KeepAlive
     // state, waiting to receive a new Request to send on the socket.
     idle: HashMap<Key, Vec<Idle<T>>>,
-    // A count of idle Conns, kept track of independentally of the HashMap
-    // for performance reasons
-    idle_count: usize,
+    // A count of Conns, could be connecting, in-progress, idle, etc.
+    // This is used to keep a maximum bound on the number of connections
+    // This is a WeakCounter so it is not counted towards the Conns count.
+    conns_count: WeakCounter,
     // A maximum number of idle connections
-    idle_max: Option<usize>,
+    max_connections: Option<usize>,
     // These are outstanding Checkouts that are waiting for a socket to be
     // able to send a Request one. This is used when "racing" for a new
     // connection.
@@ -75,7 +77,7 @@ struct Connections<T> {
     // this list is checked for any parked Checkouts, and tries to notify
     // them that the Conn could be used instead of waiting for a brand new
     // connection.
-    waiters: HashMap<Key, VecDeque<oneshot::Sender<T>>>,
+    waiters: HashMap<Key, VecDeque<oneshot::Sender<(T, Option<Counter>)>>>,
     // A oneshot channel is used to allow the interval to be notified when
     // the Pool completely drops. That way, the interval can cancel immediately.
     #[cfg(feature = "runtime")]
@@ -93,7 +95,7 @@ impl<T> Pool<T> {
     pub fn new(
         enabled: bool,
         timeout: Option<Duration>,
-        idle_max: Option<usize>,
+        max_connections: Option<usize>,
         __exec: &Exec
     ) -> Pool<T> {
         Pool {
@@ -101,8 +103,8 @@ impl<T> Pool<T> {
                 connections: Mutex::new(Connections {
                     connecting: HashSet::new(),
                     idle: HashMap::new(),
-                    idle_count: 0,
-                    idle_max,
+                    conns_count: WeakCounter::new(),
+                    max_connections,
                     #[cfg(feature = "runtime")]
                     idle_interval_ref: None,
                     waiters: HashMap::new(),
@@ -164,40 +166,61 @@ impl<T: Poolable> Pool<T> {
     }
 
     /// Ensure that there is only ever 1 connecting task for HTTP/2
-    /// connections. If HTTP/1, ensures that idle_max is respected (if exists).
+    /// connections. If HTTP/1, ensures that max_connections is respected (if exists).
     pub(super) fn connecting(&self, key: &Key) -> Result<Connecting<T>, ConnectingError> {
-        if key.1 == Ver::Http2 && self.inner.enabled {
-            let mut inner = self.inner.connections.lock().unwrap();
-            if inner.connecting.insert(key.clone()) {
-                let connecting = Connecting {
-                    key: key.clone(),
-                    pool: WeakOpt::downgrade(&self.inner),
-                };
-                Ok(connecting)
-            } else {
-                trace!("HTTP/2 connecting already in progress for {:?}", key.0);
-                Err(ConnectingError::Http2InProgress)
-            }
-        } else {
-            let can_connect = {
-                let mut connections = self.inner.connections.lock().unwrap();
-                connections
-                    .idle_max
-                    .map(|max| connections.idle_count < max)
-                    .unwrap_or(true)
-            };
+        // always return a Connecting struct if pooling is not enabled
+        if !self.inner.enabled {
+            let connections = self.inner.connections.lock().unwrap();
+            return Ok(Connecting {
+                key: key.clone(),
+                pool: WeakOpt::none(),
+                counter: Some(connections.conns_count.spawn_upgrade()),
+            });
+        }
 
-            if can_connect {
-                Ok(Connecting {
-                    key: key.clone(),
-                    // in HTTP/1's case, there is never a lock, so we don't
-                    // need to do anything in Drop.
-                    pool: WeakOpt::none(),
-                })
-            } else {
-                trace!("HTTP/1 too many idle connections, will return wait");
-                Err(ConnectingError::Http1TooManyIdle)
-            }
+        match key.1 {
+            Ver::Http2 => {
+                let mut inner = self.inner.connections.lock().unwrap();
+                if inner.connecting.insert(key.clone()) {
+                    let connecting = Connecting {
+                        key: key.clone(),
+                        pool: WeakOpt::downgrade(&self.inner),
+                        counter: Some(inner.conns_count.spawn_upgrade()),
+                    };
+                    Ok(connecting)
+                } else {
+                    trace!("HTTP/2 connecting already in progress for {:?}", key.0);
+                    Err(ConnectingError::Http2InProgress)
+                }
+            },
+            Ver::Http1 => {
+                let can_connect_counter = {
+                    let connections = self.inner.connections.lock().unwrap();
+                    let can_connect = connections
+                        .max_connections
+                        .map(|max| connections.conns_count.count() < max)
+                        .unwrap_or(true);
+
+                    if can_connect {
+                        Some(connections.conns_count.spawn_upgrade())
+                    } else {
+                        None
+                    }
+                };
+
+                if let Some(counter) = can_connect_counter {
+                    Ok(Connecting {
+                        key: key.clone(),
+                        // in HTTP/1's case, there is never a lock, so we don't
+                        // need to do anything in Drop.
+                        pool: WeakOpt::none(),
+                        counter: Some(counter),
+                    })
+                } else {
+                    trace!("HTTP/1 too many idle connections, will return wait");
+                    Err(ConnectingError::Http1TooManyIdle)
+                }
+            },
         }
     }
 
@@ -228,18 +251,17 @@ impl<T: Poolable> Pool<T> {
             };
             if empty {
                 //TODO: This could be done with the HashMap::entry API instead.
-                if let Some(values) = inner.idle.remove(key) {
-                    inner.idle_count -= values.len();
-                }
+                inner.idle.remove(key);
             }
             entry
         };
 
-        entry.map(|e| self.reuse(key, e.value))
+        entry.map(|(value, counter)| self.reuse(key, value, counter))
     }
 
     pub(super) fn pooled(&self, mut connecting: Connecting<T>, value: T) -> Pooled<T> {
-        let (value, pool_ref)  = if self.inner.enabled {
+        let counter = connecting.counter.take().expect("only place taken");
+        let (value, pool_ref, counter) = if self.inner.enabled {
             match value.reserve() {
                 Reservation::Shared(to_insert, to_return) => {
                     debug_assert_eq!(
@@ -248,7 +270,12 @@ impl<T: Poolable> Pool<T> {
                         "shared reservation without Http2"
                     );
                     let mut inner = self.inner.connections.lock().unwrap();
-                    inner.put(connecting.key.clone(), to_insert, &self.inner);
+                    inner.put(
+                        connecting.key.clone(),
+                        to_insert,
+                        counter,
+                        &self.inner
+                    );
                     // Do this here instead of Drop for Connecting because we
                     // already have a lock, no need to lock the mutex twice.
                     inner.connected(&connecting.key);
@@ -257,13 +284,15 @@ impl<T: Poolable> Pool<T> {
 
                     // Shared reservations don't need a reference to the pool,
                     // since the pool always keeps a copy.
-                    (to_return, WeakOpt::none())
+                    // Additionally they don't need a counter since they are
+                    // tracked through the Idle entry
+                    (to_return, WeakOpt::none(), None)
                 },
                 Reservation::Unique(value) => {
                     // Unique reservations must take a reference to the pool
                     // since they hope to reinsert once the reservation is
                     // completed
-                    (value, WeakOpt::downgrade(&self.inner))
+                    (value, WeakOpt::downgrade(&self.inner), Some(counter))
                 },
             }
         } else {
@@ -272,17 +301,23 @@ impl<T: Poolable> Pool<T> {
             // The Connecting should have had no pool ref
             debug_assert!(connecting.pool.upgrade().is_none());
 
-            (value, WeakOpt::none())
+            // The counter is still tracked as this is
+            // still an active connection (even if not pooled)
+            (value, WeakOpt::none(), Some(counter))
         };
         Pooled {
             key: connecting.key.clone(),
             is_reused: false,
             pool: pool_ref,
-            value: Some(value)
+            value: Some(value),
+            counter,
         }
     }
 
-    fn reuse(&self, key: &Key, value: T) -> Pooled<T> {
+    /// Counter is optional because HTTP/2 connections are not 1:1 with T values.
+    /// Because of this, we store the Counter on the Idle entry and not the spawned
+    /// Pooled<T> entries for shared reservations
+    fn reuse(&self, key: &Key, value: T, counter: Option<Counter>) -> Pooled<T> {
         debug!("reuse idle connection for {:?}", key);
         // TODO: unhack this
         // In Pool::pooled(), which is used for inserting brand new connections,
@@ -303,10 +338,11 @@ impl<T: Poolable> Pool<T> {
             key: key.clone(),
             pool: pool_ref,
             value: Some(value),
+            counter,
         }
     }
 
-    fn waiter(&mut self, key: Key, tx: oneshot::Sender<T>) {
+    fn waiter(&mut self, key: Key, tx: oneshot::Sender<(T, Option<Counter>)>) {
         trace!("checkout waiting for idle connection: {:?}", key);
         self.inner.connections.lock().unwrap()
             .waiters.entry(key)
@@ -322,7 +358,7 @@ struct IdlePopper<'a, T: 'a> {
 }
 
 impl<'a, T: Poolable + 'a> IdlePopper<'a, T> {
-    fn pop(self, expiration: &Expiration) -> Option<Idle<T>> {
+    fn pop(self, expiration: &Expiration) -> Option<(T, Option<Counter>)> {
         while let Some(entry) = self.list.pop() {
             // If the connection has been closed, or is older than our idle
             // timeout, simply drop it and keep looking...
@@ -341,23 +377,21 @@ impl<'a, T: Poolable + 'a> IdlePopper<'a, T> {
                 continue;
             }
 
-            let value = match entry.value.reserve() {
+            let (value, counter) = match entry.value.reserve() {
                 Reservation::Shared(to_reinsert, to_checkout) => {
                     self.list.push(Idle {
                         idle_at: Instant::now(),
                         value: to_reinsert,
+                        counter: entry.counter,
                     });
-                    to_checkout
+                    (to_checkout, None)
                 },
                 Reservation::Unique(unique) => {
-                    unique
+                    (unique, Some(entry.counter))
                 }
             };
 
-            return Some(Idle {
-                idle_at: entry.idle_at,
-                value,
-            });
+            return Some((value, counter));
         }
 
         None
@@ -365,7 +399,13 @@ impl<'a, T: Poolable + 'a> IdlePopper<'a, T> {
 }
 
 impl<T: Poolable> Connections<T> {
-    fn put(&mut self, key: Key, value: T, __pool_ref: &Arc<PoolInner<T>>) {
+    fn put(
+        &mut self,
+        key: Key,
+        value: T,
+        counter: Counter,
+        __pool_ref: &Arc<PoolInner<T>>
+    ) {
         if key.1 == Ver::Http2 && self.idle.contains_key(&key) {
             trace!("put; existing idle HTTP/2 connection for {:?}", key);
             return;
@@ -373,18 +413,22 @@ impl<T: Poolable> Connections<T> {
         trace!("put; add idle connection for {:?}", key);
         let mut remove_waiters = false;
         let mut value = Some(value);
+        let mut counter = Some(counter);
         if let Some(waiters) = self.waiters.get_mut(&key) {
             while let Some(tx) = waiters.pop_front() {
                 if !tx.is_canceled() {
                     let reserved = value.take().expect("value already sent");
-                    let reserved = match reserved.reserve() {
+                    let (reserved, reserved_counter) = match reserved.reserve() {
                         Reservation::Shared(to_keep, to_send) => {
                             value = Some(to_keep);
-                            to_send
+                            (to_send, None)
                         },
-                        Reservation::Unique(uniq) => uniq,
+                        Reservation::Unique(uniq) => {
+                            let counter = counter.take().expect("value already sent");
+                            (uniq, Some(counter))
+                        }
                     };
-                    match tx.send(reserved) {
+                    match tx.send((reserved, reserved_counter)) {
                         Ok(()) => {
                             if value.is_none() {
                                 break;
@@ -392,8 +436,15 @@ impl<T: Poolable> Connections<T> {
                                 continue;
                             }
                         },
-                        Err(e) => {
-                            value = Some(e);
+                        Err((reserved, reserved_counter)) => {
+                            value = Some(reserved);
+
+                            // Only re-assign counter if we were
+                            // sending a counter - otherwise we would
+                            // replace a valid counter with None
+                            if reserved_counter.is_some() {
+                                counter = reserved_counter;
+                            }
                         }
                     }
                 }
@@ -406,23 +457,28 @@ impl<T: Poolable> Connections<T> {
             self.waiters.remove(&key);
         }
 
-        match value {
-            Some(value) => {
+        match (value, counter) {
+            (Some(value), Some(counter)) => {
                 debug!("pooling idle connection for {:?}", key);
                 self.idle.entry(key)
                      .or_insert(Vec::new())
                      .push(Idle {
                          value: value,
                          idle_at: Instant::now(),
+                         counter,
                      });
-                self.idle_count += 1;
 
                 #[cfg(feature = "runtime")]
                 {
                     self.spawn_idle_interval(__pool_ref);
                 }
-            }
-            None => trace!("put; found waiter for {:?}", key),
+            },
+            (None, None) => trace!("put; found waiter for {:?}", key),
+            _ => {
+                warn!("Invalid combo of (value, counter), logic error - counter \
+                       should always accompany value into Idle entry!");
+                debug_assert!(false, "Invalid combo of (value, counter)");
+            },
         }
     }
 
@@ -501,17 +557,14 @@ impl<T: Poolable> Connections<T> {
         let now = Instant::now();
         //self.last_idle_check_at = now;
 
-        let mut removed = 0;
         self.idle.retain(|key, values| {
             values.retain(|entry| {
                 if !entry.value.is_open() {
                     trace!("idle interval evicting closed for {:?}", key);
-                    removed += 1;
                     return false;
                 }
                 if now - entry.idle_at > dur {
                     trace!("idle interval evicting expired for {:?}", key);
-                    removed += 1;
                     return false;
                 }
 
@@ -522,7 +575,6 @@ impl<T: Poolable> Connections<T> {
             // returning false evicts this key/val
             !values.is_empty()
         });
-        self.idle_count -= removed;
     }
 }
 
@@ -541,6 +593,7 @@ pub(super) struct Pooled<T: Poolable> {
     is_reused: bool,
     key: Key,
     pool: WeakOpt<PoolInner<T>>,
+    counter: Option<Counter>,
 }
 
 impl<T: Poolable> Pooled<T> {
@@ -588,8 +641,14 @@ impl<T: Poolable> Drop for Pooled<T> {
                 // not enabled!
                 debug_assert!(pool.enabled);
 
-                if let Ok(mut inner) = pool.connections.lock() {
-                    inner.put(self.key.clone(), value, &pool);
+                // Re-using a pooled connection should always
+                // have a counter tracking the connection
+                debug_assert!(self.counter.is_some());
+
+                if let (Ok(mut inner), Some(counter)) =
+                    (pool.connections.lock(), self.counter.take())
+                {
+                    inner.put(self.key.clone(), value, counter, &pool);
                 }
             } else if self.key.1 == Ver::Http1 {
                 trace!("pool dropped, dropping pooled ({:?})", self.key);
@@ -611,12 +670,13 @@ impl<T: Poolable> fmt::Debug for Pooled<T> {
 struct Idle<T> {
     idle_at: Instant,
     value: T,
+    counter: Counter,
 }
 
 pub(super) struct Checkout<T> {
     key: Key,
     pool: Pool<T>,
-    waiter: Option<oneshot::Receiver<T>>,
+    waiter: Option<oneshot::Receiver<(T, Option<Counter>)>>,
 }
 
 impl<T: Poolable> Checkout<T> {
@@ -624,9 +684,9 @@ impl<T: Poolable> Checkout<T> {
         static CANCELED: &str = "pool checkout failed";
         if let Some(mut rx) = self.waiter.take() {
             match rx.poll() {
-                Ok(Async::Ready(value)) => {
+                Ok(Async::Ready((value, counter))) => {
                     if value.is_open() {
-                        Ok(Async::Ready(Some(self.pool.reuse(&self.key, value))))
+                        Ok(Async::Ready(Some(self.pool.reuse(&self.key, value, counter))))
                     } else {
                         Err(::Error::new_canceled(Some(CANCELED)))
                     }
@@ -685,6 +745,9 @@ impl<T> Drop for Checkout<T> {
 pub(super) struct Connecting<T: Poolable> {
     key: Key,
     pool: WeakOpt<PoolInner<T>>,
+    // Option<_> because we need to take this from Connecting
+    // when it actually connects. Otherwise it can drop.
+    counter: Option<Counter>,
 }
 
 impl<T: Poolable> Drop for Connecting<T> {
@@ -786,7 +849,7 @@ mod tests {
     use futures::{Async, Future};
     use futures::future;
     use common::Exec;
-    use super::{Connecting, Key, Poolable, Pool, Reservation, Ver, WeakOpt};
+    use super::{Connecting, Key, Poolable, Pool, Reservation, Ver, WeakOpt, Counter};
 
     /// Test unique reservations.
     #[derive(Debug, PartialEq, Eq)]
@@ -806,6 +869,7 @@ mod tests {
         Connecting {
             key,
             pool: WeakOpt::none(),
+            counter: Some(Counter::new()), // not tied to any count
         }
     }
 
