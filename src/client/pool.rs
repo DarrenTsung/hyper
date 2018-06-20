@@ -66,7 +66,10 @@ struct Connections<T> {
     // This is used to keep a maximum bound on the number of connections
     // This is a WeakCounter so it is not counted towards the Conns count.
     conns_count: WeakCounter,
-    // A maximum number of idle connections
+    // An optional maximum number of connections. HTTP/1 requests will
+    // not create a new connection if this limit is reached, they will instead
+    // wait to re-use a new idle connection or error if no idle connection will
+    // be possible (no active requests for the Key).
     max_connections: Option<usize>,
     // These are outstanding Checkouts that are waiting for a socket to be
     // able to send a Request one. This is used when "racing" for a new
