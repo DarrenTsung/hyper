@@ -264,45 +264,48 @@ where C: Connect + Sync + 'static,
                 uri: url,
             };
             future::lazy(move || {
-                if let Some(connecting) = pool.connecting(&pool_key) {
-                    Either::A(connector.connect(dst)
-                        .map_err(::Error::new_connect)
-                        .and_then(move |(io, connected)| {
-                            conn::Builder::new()
-                                .exec(executor.clone())
-                                .h1_writev(h1_writev)
-                                .h1_title_case_headers(h1_title_case_headers)
-                                .http2_only(pool_key.1 == Ver::Http2)
-                                .handshake(io)
-                                .and_then(move |(tx, conn)| {
-                                    let bg = executor.execute(conn.map_err(|e| {
-                                        debug!("client connection error: {}", e)
-                                    }));
+                match pool.connecting(&pool_key) {
+                    Ok(connecting) => {
+                        Either::A(connector.connect(dst)
+                            .map_err(::Error::new_connect)
+                            .and_then(move |(io, connected)| {
+                                conn::Builder::new()
+                                    .exec(executor.clone())
+                                    .h1_writev(h1_writev)
+                                    .h1_title_case_headers(h1_title_case_headers)
+                                    .http2_only(pool_key.1 == Ver::Http2)
+                                    .handshake(io)
+                                    .and_then(move |(tx, conn)| {
+                                        let bg = executor.execute(conn.map_err(|e| {
+                                            debug!("client connection error: {}", e)
+                                        }));
 
-                                    // This task is critical, so an execute error
-                                    // should be returned.
-                                    if let Err(err) = bg {
-                                        warn!("error spawning critical client task: {}", err);
-                                        return Either::A(future::err(err));
-                                    }
+                                        // This task is critical, so an execute error
+                                        // should be returned.
+                                        if let Err(err) = bg {
+                                            warn!("error spawning critical client task: {}", err);
+                                            return Either::A(future::err(err));
+                                        }
 
-                                    // Wait for 'conn' to ready up before we
-                                    // declare this tx as usable
-                                    Either::B(tx.when_ready())
-                                })
-                                .map(move |tx| {
-                                    pool.pooled(connecting, PoolClient {
-                                        is_proxied: connected.is_proxied,
-                                        tx: match ver {
-                                            Ver::Http1 => PoolTx::Http1(tx),
-                                            Ver::Http2 => PoolTx::Http2(tx.into_http2()),
-                                        },
+                                        // Wait for 'conn' to ready up before we
+                                        // declare this tx as usable
+                                        Either::B(tx.when_ready())
                                     })
-                                })
-                        }))
-                } else {
-                    let canceled = ::Error::new_canceled(Some("HTTP/2 connection in progress"));
-                    Either::B(future::err(canceled))
+                                    .map(move |tx| {
+                                        pool.pooled(connecting, PoolClient {
+                                            is_proxied: connected.is_proxied,
+                                            tx: match ver {
+                                                Ver::Http1 => PoolTx::Http1(tx),
+                                                Ver::Http2 => PoolTx::Http2(tx.into_http2()),
+                                            },
+                                        })
+                                    })
+                            }))
+                    },
+                    Err(connecting_err) => {
+                        let canceled = ::Error::new_canceled(Some(connecting_err));
+                        Either::B(future::err(canceled))
+                    },
                 }
             })
         };
@@ -313,7 +316,8 @@ where C: Connect + Sync + 'static,
                 // Either checkout or connect could get canceled:
                 //
                 // 1. Connect is canceled if this is HTTP/2 and there is
-                //    an outstanding HTTP/2 connecting task.
+                //    an outstanding HTTP/2 connecting task OR this is HTTP/1
+                //    and there are too many idle connections.
                 // 2. Checkout is canceled if the pool cannot deliver an
                 //    idle connection reliably.
                 //
@@ -636,6 +640,7 @@ pub struct Builder {
     exec: Exec,
     keep_alive: bool,
     keep_alive_timeout: Option<Duration>,
+    idle_connection_max: Option<usize>,
     h1_writev: bool,
     h1_title_case_headers: bool,
     //TODO: make use of max_idle config
@@ -651,6 +656,7 @@ impl Default for Builder {
             exec: Exec::Default,
             keep_alive: true,
             keep_alive_timeout: Some(Duration::from_secs(90)),
+            idle_connection_max: None,
             h1_writev: true,
             h1_title_case_headers: false,
             max_idle: 5,
@@ -682,6 +688,17 @@ impl Builder {
         D: Into<Option<Duration>>,
     {
         self.keep_alive_timeout = val.into();
+        self
+    }
+
+    /// Set an optional maximum for idle sockets being kept-alive.
+    /// This is local to the client and will not synchronize across
+    /// multiple clients.
+    ///
+    /// Default is 'None'
+    #[inline]
+    pub fn idle_connection_max<D>(&mut self, val: Option<usize>) -> &mut Self {
+        self.idle_connection_max = val;
         self
     }
 
@@ -790,7 +807,12 @@ impl Builder {
             executor: self.exec.clone(),
             h1_writev: self.h1_writev,
             h1_title_case_headers: self.h1_title_case_headers,
-            pool: Pool::new(self.keep_alive, self.keep_alive_timeout, &self.exec),
+            pool: Pool::new(
+                self.keep_alive,
+                self.keep_alive_timeout,
+                self.idle_connection_max,
+                &self.exec
+            ),
             retry_canceled_requests: self.retry_canceled_requests,
             set_host: self.set_host,
             ver: self.ver,

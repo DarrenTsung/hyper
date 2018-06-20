@@ -3,6 +3,7 @@ use std::fmt;
 use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
+use std::error::Error;
 
 use futures::{Future, Async, Poll};
 use futures::sync::oneshot;
@@ -60,6 +61,11 @@ struct Connections<T> {
     // These are internal Conns sitting in the event loop in the KeepAlive
     // state, waiting to receive a new Request to send on the socket.
     idle: HashMap<Key, Vec<Idle<T>>>,
+    // A count of idle Conns, kept track of independentally of the HashMap
+    // for performance reasons
+    idle_count: usize,
+    // A maximum number of idle connections
+    idle_max: Option<usize>,
     // These are outstanding Checkouts that are waiting for a socket to be
     // able to send a Request one. This is used when "racing" for a new
     // connection.
@@ -84,12 +90,19 @@ struct Connections<T> {
 struct WeakOpt<T>(Option<Weak<T>>);
 
 impl<T> Pool<T> {
-    pub fn new(enabled: bool, timeout: Option<Duration>, __exec: &Exec) -> Pool<T> {
+    pub fn new(
+        enabled: bool,
+        timeout: Option<Duration>,
+        idle_max: Option<usize>,
+        __exec: &Exec
+    ) -> Pool<T> {
         Pool {
             inner: Arc::new(PoolInner {
                 connections: Mutex::new(Connections {
                     connecting: HashSet::new(),
                     idle: HashMap::new(),
+                    idle_count: 0,
+                    idle_max,
                     #[cfg(feature = "runtime")]
                     idle_interval_ref: None,
                     waiters: HashMap::new(),
@@ -115,6 +128,30 @@ impl<T> Pool<T> {
     }
 }
 
+#[derive(Debug)]
+pub(super) enum ConnectingError {
+    Http2InProgress,
+    Http1TooManyIdle,
+}
+
+impl Error for ConnectingError {
+    fn description(&self) -> &str {
+        match self {
+            ConnectingError::Http2InProgress => { "HTTP/2 connecting already in progress" },
+            ConnectingError::Http1TooManyIdle => { "HTTP/1 too many idle connections" },
+        }
+    }
+}
+
+impl fmt::Display for ConnectingError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            ConnectingError::Http2InProgress => { write!(f, "HTTP/2 connecting already in progress") },
+            ConnectingError::Http1TooManyIdle => { write!(f, "HTTP/1 too many idle connections") },
+        }
+    }
+}
+
 impl<T: Poolable> Pool<T> {
     /// Returns a `Checkout` which is a future that resolves if an idle
     /// connection becomes available.
@@ -127,8 +164,8 @@ impl<T: Poolable> Pool<T> {
     }
 
     /// Ensure that there is only ever 1 connecting task for HTTP/2
-    /// connections. This does nothing for HTTP/1.
-    pub(super) fn connecting(&self, key: &Key) -> Option<Connecting<T>> {
+    /// connections. If HTTP/1, ensures that idle_max is respected (if exists).
+    pub(super) fn connecting(&self, key: &Key) -> Result<Connecting<T>, ConnectingError> {
         if key.1 == Ver::Http2 && self.inner.enabled {
             let mut inner = self.inner.connections.lock().unwrap();
             if inner.connecting.insert(key.clone()) {
@@ -136,18 +173,31 @@ impl<T: Poolable> Pool<T> {
                     key: key.clone(),
                     pool: WeakOpt::downgrade(&self.inner),
                 };
-                Some(connecting)
+                Ok(connecting)
             } else {
                 trace!("HTTP/2 connecting already in progress for {:?}", key.0);
-                None
+                Err(ConnectingError::Http2InProgress)
             }
         } else {
-            Some(Connecting {
-                key: key.clone(),
-                // in HTTP/1's case, there is never a lock, so we don't
-                // need to do anything in Drop.
-                pool: WeakOpt::none(),
-            })
+            let can_connect = {
+                let mut connections = self.inner.connections.lock().unwrap();
+                connections
+                    .idle_max
+                    .map(|max| connections.idle_count < max)
+                    .unwrap_or(true)
+            };
+
+            if can_connect {
+                Ok(Connecting {
+                    key: key.clone(),
+                    // in HTTP/1's case, there is never a lock, so we don't
+                    // need to do anything in Drop.
+                    pool: WeakOpt::none(),
+                })
+            } else {
+                trace!("HTTP/1 too many idle connections, will return wait");
+                Err(ConnectingError::Http1TooManyIdle)
+            }
         }
     }
 
@@ -178,7 +228,9 @@ impl<T: Poolable> Pool<T> {
             };
             if empty {
                 //TODO: This could be done with the HashMap::entry API instead.
-                inner.idle.remove(key);
+                if let Some(values) = inner.idle.remove(key) {
+                    inner.idle_count -= values.len();
+                }
             }
             entry
         };
@@ -363,6 +415,7 @@ impl<T: Poolable> Connections<T> {
                          value: value,
                          idle_at: Instant::now(),
                      });
+                self.idle_count += 1;
 
                 #[cfg(feature = "runtime")]
                 {
@@ -448,14 +501,17 @@ impl<T: Poolable> Connections<T> {
         let now = Instant::now();
         //self.last_idle_check_at = now;
 
+        let mut removed = 0;
         self.idle.retain(|key, values| {
             values.retain(|entry| {
                 if !entry.value.is_open() {
                     trace!("idle interval evicting closed for {:?}", key);
+                    removed += 1;
                     return false;
                 }
                 if now - entry.idle_at > dur {
                     trace!("idle interval evicting expired for {:?}", key);
+                    removed += 1;
                     return false;
                 }
 
@@ -466,6 +522,7 @@ impl<T: Poolable> Connections<T> {
             // returning false evicts this key/val
             !values.is_empty()
         });
+        self.idle_count -= removed;
     }
 }
 
@@ -753,7 +810,7 @@ mod tests {
     }
 
     fn pool_no_timer<T>() -> Pool<T> {
-        let pool = Pool::new(true, Some(Duration::from_millis(100)), &Exec::Default);
+        let pool = Pool::new(true, Some(Duration::from_millis(100)), None, &Exec::Default);
         pool.no_timer();
         pool
     }
@@ -812,7 +869,7 @@ mod tests {
         use std::time::Instant;
         use tokio_timer::Delay;
         let mut rt = ::tokio::runtime::current_thread::Runtime::new().unwrap();
-        let pool = Pool::new(true, Some(Duration::from_millis(100)), &Exec::Default);
+        let pool = Pool::new(true, Some(Duration::from_millis(100)), None, &Exec::Default);
 
         let key = (Arc::new("foo".to_string()), Ver::Http1);
 
