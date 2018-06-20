@@ -317,7 +317,7 @@ where C: Connect + Sync + 'static,
                 //
                 // 1. Connect is canceled if this is HTTP/2 and there is
                 //    an outstanding HTTP/2 connecting task OR this is HTTP/1
-                //    and there are too many idle connections.
+                //    and there are too many connections.
                 // 2. Checkout is canceled if the pool cannot deliver an
                 //    idle connection reliably.
                 //
