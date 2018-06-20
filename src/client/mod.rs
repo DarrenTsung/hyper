@@ -697,8 +697,11 @@ impl Builder {
     ///
     /// Default is 'None'
     #[inline]
-    pub fn max_idle_connections<D>(&mut self, val: Option<usize>) -> &mut Self {
-        self.max_idle_connections = val;
+    pub fn max_idle_connections<V>(&mut self, val: V) -> &mut Self
+    where
+        V: Into<Option<usize>>,
+    {
+        self.max_idle_connections = val.into();
         self
     }
 
