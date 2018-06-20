@@ -136,14 +136,14 @@ impl<T> Pool<T> {
 #[derive(Debug)]
 pub(super) enum ConnectingError {
     Http2InProgress,
-    Http1TooManyIdle,
+    Http1TooManyConnections,
 }
 
 impl Error for ConnectingError {
     fn description(&self) -> &str {
         match self {
             ConnectingError::Http2InProgress => { "HTTP/2 connecting already in progress" },
-            ConnectingError::Http1TooManyIdle => { "HTTP/1 too many idle connections" },
+            ConnectingError::Http1TooManyConnections => { "HTTP/1 too many connections" },
         }
     }
 }
@@ -152,7 +152,7 @@ impl fmt::Display for ConnectingError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             ConnectingError::Http2InProgress => { write!(f, "HTTP/2 connecting already in progress") },
-            ConnectingError::Http1TooManyIdle => { write!(f, "HTTP/1 too many idle connections") },
+            ConnectingError::Http1TooManyConnections => { write!(f, "HTTP/1 too many connections") },
         }
     }
 }
@@ -220,8 +220,8 @@ impl<T: Poolable> Pool<T> {
                         counter: Some(counter),
                     })
                 } else {
-                    trace!("HTTP/1 too many idle connections, will return wait");
-                    Err(ConnectingError::Http1TooManyIdle)
+                    trace!("HTTP/1 too many connections, will return wait");
+                    Err(ConnectingError::Http1TooManyConnections)
                 }
             },
         }
