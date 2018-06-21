@@ -25,6 +25,7 @@ pub(super) struct Pool<T> {
 // See https://github.com/hyperium/hyper/issues/1429
 pub(super) trait Poolable: Send + Sized + 'static {
     fn is_open(&self) -> bool;
+    fn close(&mut self);
     /// Reserve this connection.
     ///
     /// Allows for HTTP/2 to return a shared reservation.
@@ -66,6 +67,9 @@ struct Connections<T> {
     // This is used to keep a maximum bound on the number of connections
     // This is a WeakCounter so it is not counted towards the Conns count.
     conns_count: WeakCounter,
+    // A list of evicted idle connections, kept until the connection is
+    // officially closed
+    evicted_idle: Vec<Idle<T>>,
     // An optional maximum number of connections. HTTP/1 requests will
     // not create a new connection if this limit is reached, they will instead
     // wait to re-use a new idle connection or error if no idle connection will
@@ -108,6 +112,7 @@ impl<T> Pool<T> {
                     idle: HashMap::new(),
                     conns_count: WeakCounter::new(),
                     max_connections,
+                    evicted_idle: Vec::new(),
                     #[cfg(feature = "runtime")]
                     idle_interval_ref: None,
                     waiters: HashMap::new(),
@@ -207,11 +212,8 @@ impl<T: Poolable> Pool<T> {
                     // check if we can evict an Idle connection
                     // before making a new connection
                     if !can_connect {
-                        can_connect = connections.idle
-                            .values_mut()
-                            .any(|v| {
-                                v.pop().is_some()
-                            });
+                        let evicted = connections.evict_idle();
+                        can_connect = evicted;
                     }
 
                     if can_connect {
@@ -495,6 +497,31 @@ impl<T: Poolable> Connections<T> {
         }
     }
 
+    /// Evict 1 idle connection if possible, otherwise
+    /// return false.
+    fn evict_idle(&mut self) -> bool {
+        let evicted = {
+            let mut ret = None;
+            for values in self.idle.values_mut() {
+                if let Some(v) = values.pop() {
+                    ret = Some(v);
+                    break;
+                }
+            }
+
+            ret
+        };
+
+        if let Some(mut evicted) = evicted {
+            evicted.value.close();
+
+            self.evicted_idle.push(evicted);
+            true
+        } else {
+            false
+        }
+    }
+
     /// A `Connecting` task is complete. Not necessarily successfully,
     /// but the lock is going away, so clean up.
     fn connected(&mut self, key: &Key) {
@@ -588,6 +615,20 @@ impl<T: Poolable> Connections<T> {
             // returning false evicts this key/val
             !values.is_empty()
         });
+
+        self.evicted_idle.retain(|entry| {
+            if !entry.value.is_open() {
+                trace!("evicted idle closed");
+                return false;
+            }
+
+            if now - entry.idle_at > dur {
+                trace!("evicted idle expired");
+                return false;
+            }
+
+            true
+        })
     }
 }
 
@@ -873,6 +914,8 @@ mod tests {
             true
         }
 
+        fn close(&mut self) { unimplemented!(); }
+
         fn reserve(self) -> Reservation<Self> {
             Reservation::Unique(self)
         }
@@ -1024,6 +1067,8 @@ mod tests {
         fn is_open(&self) -> bool {
             !self.closed
         }
+
+        fn close(&mut self) { unimplemented!(); }
 
         fn reserve(self) -> Reservation<Self> {
             Reservation::Unique(self)

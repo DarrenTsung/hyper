@@ -13,7 +13,7 @@ pub fn channel<T, U>() -> (Sender<T, U>, Receiver<T, U>) {
     let tx = Sender {
         buffered_once: false,
         giver: giver,
-        inner: tx,
+        inner: Some(tx),
     };
     let rx = Receiver {
         inner: rx,
@@ -37,7 +37,7 @@ pub struct Sender<T, U> {
     /// for more.
     giver: want::Giver,
     /// Actually bounded by the Giver, plus `buffered_once`.
-    inner: mpsc::UnboundedSender<Envelope<T, U>>,
+    inner: Option<mpsc::UnboundedSender<Envelope<T, U>>>,
 }
 
 /// An unbounded version.
@@ -47,7 +47,7 @@ pub struct Sender<T, U> {
 pub struct UnboundedSender<T, U> {
     /// Only used for `is_closed`, since mpsc::UnboundedSender cannot be checked.
     giver: want::SharedGiver,
-    inner: mpsc::UnboundedSender<Envelope<T, U>>,
+    inner: Option<mpsc::UnboundedSender<Envelope<T, U>>>,
 }
 
 impl<T, U> Sender<T, U> {
@@ -62,6 +62,13 @@ impl<T, U> Sender<T, U> {
 
     pub fn is_closed(&self) -> bool {
         self.giver.is_canceled()
+    }
+
+    pub fn close(&mut self) {
+        let sender = self.inner.take();
+
+        // probably should not close multiple times
+        debug_assert!(sender.is_some());
     }
 
     fn can_send(&mut self) -> bool {
@@ -82,9 +89,13 @@ impl<T, U> Sender<T, U> {
             return Err(val);
         }
         let (tx, rx) = oneshot::channel();
-        self.inner.unbounded_send(Envelope(Some((val, Callback::Retry(tx)))))
-            .map(move |_| rx)
-            .map_err(|e| e.into_inner().0.take().expect("envelope not dropped").0)
+        if let Some(ref inner) = self.inner {
+            inner.unbounded_send(Envelope(Some((val, Callback::Retry(tx)))))
+                .map(move |_| rx)
+                .map_err(|e| e.into_inner().0.take().expect("envelope not dropped").0)
+        } else {
+            Err(val)
+        }
     }
 
     pub fn send(&mut self, val: T) -> Result<Promise<U>, T> {
@@ -92,9 +103,13 @@ impl<T, U> Sender<T, U> {
             return Err(val);
         }
         let (tx, rx) = oneshot::channel();
-        self.inner.unbounded_send(Envelope(Some((val, Callback::NoRetry(tx)))))
-            .map(move |_| rx)
-            .map_err(|e| e.into_inner().0.take().expect("envelope not dropped").0)
+        if let Some(ref inner) = self.inner {
+            inner.unbounded_send(Envelope(Some((val, Callback::NoRetry(tx)))))
+                .map(move |_| rx)
+                .map_err(|e| e.into_inner().0.take().expect("envelope not dropped").0)
+        } else {
+            Err(val)
+        }
     }
 
     pub fn unbound(self) -> UnboundedSender<T, U> {
@@ -116,9 +131,13 @@ impl<T, U> UnboundedSender<T, U> {
 
     pub fn try_send(&mut self, val: T) -> Result<RetryPromise<T, U>, T> {
         let (tx, rx) = oneshot::channel();
-        self.inner.unbounded_send(Envelope(Some((val, Callback::Retry(tx)))))
-            .map(move |_| rx)
-            .map_err(|e| e.into_inner().0.take().expect("envelope not dropped").0)
+        if let Some(ref inner) = self.inner {
+            inner.unbounded_send(Envelope(Some((val, Callback::Retry(tx)))))
+                .map(move |_| rx)
+                .map_err(|e| e.into_inner().0.take().expect("envelope not dropped").0)
+        } else {
+            Err(val)
+        }
     }
 }
 

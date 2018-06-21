@@ -156,6 +156,10 @@ impl<B> SendRequest<B>
         self.dispatch.is_closed()
     }
 
+    pub(super) fn close(&mut self) {
+        self.dispatch.close();
+    }
+
     pub(super) fn into_http2(self) -> Http2SendRequest<B> {
         Http2SendRequest {
             dispatch: self.dispatch.unbound(),
@@ -589,4 +593,3 @@ impl AssertSendSync for Builder {}
 
 #[doc(hidden)]
 impl AssertSend for ResponseFuture {}
-

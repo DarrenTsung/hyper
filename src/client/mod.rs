@@ -577,6 +577,14 @@ where
         }
     }
 
+    fn close(&mut self) {
+        match self.tx {
+            PoolTx::Http1(ref mut tx) => tx.close(),
+            // Http2 connections should not be closed this way
+            PoolTx::Http2(ref _tx) => (),
+        }
+    }
+
     fn reserve(self) -> Reservation<Self> {
         match self.tx {
             PoolTx::Http1(tx) => {
