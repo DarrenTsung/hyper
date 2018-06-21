@@ -198,21 +198,11 @@ impl<T: Poolable> Pool<T> {
             },
             Ver::Http1 => {
                 let can_connect_counter = {
-                    let mut connections = self.inner.connections.lock().unwrap();
-                    let mut can_connect = connections
+                    let connections = self.inner.connections.lock().unwrap();
+                    let can_connect = connections
                         .max_connections
                         .map(|max| connections.conns_count.count() < max)
                         .unwrap_or(true);
-
-                    // check if we can evict an Idle connection
-                    // before making a new connection
-                    if !can_connect {
-                        can_connect = connections.idle
-                            .values_mut()
-                            .any(|v| {
-                                v.pop().is_some()
-                            });
-                    }
 
                     if can_connect {
                         Some(connections.conns_count.spawn_upgrade())
