@@ -66,11 +66,6 @@ struct Connections<T> {
     // This is used to keep a maximum bound on the number of connections
     // This is a WeakCounter so it is not counted towards the Conns count.
     conns_count: WeakCounter,
-    // An optional maximum number of connections. HTTP/1 requests will
-    // not create a new connection if this limit is reached, they will instead
-    // wait to re-use a new idle connection or error if no idle connection will
-    // be possible (no active requests for the Key).
-    max_connections: Option<usize>,
     // These are outstanding Checkouts that are waiting for a socket to be
     // able to send a Request one. This is used when "racing" for a new
     // connection.
@@ -98,7 +93,7 @@ impl<T> Pool<T> {
     pub fn new(
         enabled: bool,
         timeout: Option<Duration>,
-        max_connections: Option<usize>,
+        conns_counter: Option<WeakCounter>,
         __exec: &Exec
     ) -> Pool<T> {
         Pool {
@@ -106,8 +101,7 @@ impl<T> Pool<T> {
                 connections: Mutex::new(Connections {
                     connecting: HashSet::new(),
                     idle: HashMap::new(),
-                    conns_count: WeakCounter::new(),
-                    max_connections,
+                    conns_count: conns_counter.unwrap_or_else(WeakCounter::new),
                     #[cfg(feature = "runtime")]
                     idle_interval_ref: None,
                     waiters: HashMap::new(),
@@ -136,14 +130,12 @@ impl<T> Pool<T> {
 #[derive(Debug)]
 pub(super) enum ConnectingError {
     Http2InProgress,
-    Http1TooManyConnections,
 }
 
 impl Error for ConnectingError {
     fn description(&self) -> &str {
         match self {
             ConnectingError::Http2InProgress => { "HTTP/2 connecting already in progress" },
-            ConnectingError::Http1TooManyConnections => { "HTTP/1 too many connections" },
         }
     }
 }
@@ -152,7 +144,6 @@ impl fmt::Display for ConnectingError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             ConnectingError::Http2InProgress => { write!(f, "HTTP/2 connecting already in progress") },
-            ConnectingError::Http1TooManyConnections => { write!(f, "HTTP/1 too many connections") },
         }
     }
 }
@@ -169,61 +160,35 @@ impl<T: Poolable> Pool<T> {
     }
 
     /// Ensure that there is only ever 1 connecting task for HTTP/2
-    /// connections. If HTTP/1, ensures that max_connections is respected (if exists).
-    pub(super) fn connecting(&self, key: &Key) -> Result<Connecting<T>, ConnectingError> {
-        // always return a Connecting struct if pooling is not enabled
-        if !self.inner.enabled {
-            let connections = self.inner.connections.lock().unwrap();
-            return Ok(Connecting {
-                key: key.clone(),
-                pool: WeakOpt::none(),
-                counter: Some(connections.conns_count.spawn_upgrade()),
-            });
-        }
-
-        match key.1 {
-            Ver::Http2 => {
-                let mut inner = self.inner.connections.lock().unwrap();
-                if inner.connecting.insert(key.clone()) {
-                    let connecting = Connecting {
-                        key: key.clone(),
-                        pool: WeakOpt::downgrade(&self.inner),
-                        counter: Some(inner.conns_count.spawn_upgrade()),
-                    };
-                    Ok(connecting)
-                } else {
-                    trace!("HTTP/2 connecting already in progress for {:?}", key.0);
-                    Err(ConnectingError::Http2InProgress)
-                }
-            },
-            Ver::Http1 => {
-                let can_connect_counter = {
-                    let connections = self.inner.connections.lock().unwrap();
-                    let can_connect = connections
-                        .max_connections
-                        .map(|max| connections.conns_count.count() < max)
-                        .unwrap_or(true);
-
-                    if can_connect {
-                        Some(connections.conns_count.spawn_upgrade())
-                    } else {
-                        None
-                    }
+    /// connections.
+    pub(super) fn connecting(
+        &self,
+        key: &Key,
+        counter: Option<Counter>
+    ) -> Result<Connecting<T>, ConnectingError>
+    {
+        if key.1 == Ver::Http2 && self.inner.enabled {
+            let mut inner = self.inner.connections.lock().unwrap();
+            if inner.connecting.insert(key.clone()) {
+                let connecting = Connecting {
+                    key: key.clone(),
+                    pool: WeakOpt::downgrade(&self.inner),
+                    counter: Some(counter.unwrap_or_else(|| inner.conns_count.spawn_upgrade())),
                 };
-
-                if let Some(counter) = can_connect_counter {
-                    Ok(Connecting {
-                        key: key.clone(),
-                        // in HTTP/1's case, there is never a lock, so we don't
-                        // need to do anything in Drop.
-                        pool: WeakOpt::none(),
-                        counter: Some(counter),
-                    })
-                } else {
-                    trace!("HTTP/1 too many connections, will return wait");
-                    Err(ConnectingError::Http1TooManyConnections)
-                }
-            },
+                Ok(connecting)
+            } else {
+                trace!("HTTP/2 connecting already in progress for {:?}", key.0);
+                Err(ConnectingError::Http2InProgress)
+            }
+        } else {
+            let inner = self.inner.connections.lock().unwrap();
+            Ok(Connecting {
+                key: key.clone(),
+                // in HTTP/1's case, there is never a lock, so we don't
+                // need to do anything in Drop.
+                pool: WeakOpt::none(),
+                counter: Some(counter.unwrap_or_else(|| inner.conns_count.spawn_upgrade())),
+            })
         }
     }
 

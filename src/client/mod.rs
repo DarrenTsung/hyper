@@ -88,6 +88,7 @@ use futures::sync::oneshot;
 use http::{Method, Request, Response, Uri, Version};
 use http::header::{Entry, HeaderValue, HOST};
 use http::uri::Scheme;
+use raii_counter::{Counter, WeakCounter};
 
 use body::{Body, Payload};
 use common::Exec;
@@ -188,11 +189,26 @@ where C: Connect + Sync + 'static,
 
         let mut req = Request::new(body);
         *req.uri_mut() = uri;
-        self.request(req)
+        self.inner_request(req, None)
     }
 
     /// Send a constructed Request using this Client.
-    pub fn request(&self, mut req: Request<B>) -> ResponseFuture {
+    pub fn request(&self, req: Request<B>) -> ResponseFuture {
+        self.inner_request(req, None)
+    }
+
+    /// Send a constructed Request using this Client. Pass along
+    /// a connection counter that is given to the newly created Request
+    /// when it creates a connection.
+    pub fn request_with_counter(
+        &self,
+        req: Request<B>,
+        conn_counter: Counter
+    ) -> ResponseFuture {
+        self.inner_request(req, Some(conn_counter))
+    }
+
+    fn inner_request(&self, mut req: Request<B>, conn_counter: Option<Counter>) -> ResponseFuture {
         match req.version() {
             Version::HTTP_10 |
             Version::HTTP_11 => (),
@@ -241,7 +257,7 @@ where C: Connect + Sync + 'static,
         let uri = req.uri().clone();
         let fut = RetryableSendRequest {
             client: client,
-            future: self.send_request(req, &domain),
+            future: self.send_request(req, &domain, conn_counter),
             domain: domain,
             uri: uri,
         };
@@ -249,7 +265,13 @@ where C: Connect + Sync + 'static,
     }
 
     //TODO: replace with `impl Future` when stable
-    fn send_request(&self, mut req: Request<B>, domain: &str) -> Box<Future<Item=Response<Body>, Error=ClientError<B>> + Send> {
+    fn send_request(
+        &self,
+        mut req: Request<B>,
+        domain: &str,
+        conn_counter: Option<Counter>,
+    ) -> Box<Future<Item=Response<Body>, Error=ClientError<B>> + Send>
+    {
         let url = req.uri().clone();
         let ver = self.ver;
         let pool_key = (Arc::new(domain.to_string()), self.ver);
@@ -264,7 +286,7 @@ where C: Connect + Sync + 'static,
                 uri: url,
             };
             future::lazy(move || {
-                match pool.connecting(&pool_key) {
+                match pool.connecting(&pool_key, conn_counter) {
                     Ok(connecting) => {
                         Either::A(connector.connect(dst)
                             .map_err(::Error::new_connect)
@@ -513,7 +535,7 @@ where
 
                     trace!("unstarted request canceled, trying again (reason={:?})", reason);
                     *req.uri_mut() = self.uri.clone();
-                    self.future = self.client.send_request(req, &self.domain);
+                    self.future = self.client.send_request(req, &self.domain, None);
                 }
             }
         }
@@ -640,7 +662,6 @@ pub struct Builder {
     exec: Exec,
     keep_alive: bool,
     keep_alive_timeout: Option<Duration>,
-    max_connections: Option<usize>,
     h1_writev: bool,
     h1_title_case_headers: bool,
     //TODO: make use of max_idle config
@@ -656,7 +677,6 @@ impl Default for Builder {
             exec: Exec::Default,
             keep_alive: true,
             keep_alive_timeout: Some(Duration::from_secs(90)),
-            max_connections: None,
             h1_writev: true,
             h1_title_case_headers: false,
             max_idle: 5,
@@ -688,23 +708,6 @@ impl Builder {
         D: Into<Option<Duration>>,
     {
         self.keep_alive_timeout = val.into();
-        self
-    }
-
-    /// Set an optional maximum for connections. Requests beyond this limit
-    /// will wait for an re-usable connection, failing if no re-usable connection
-    /// will exist (no active connections for the same Key).
-    ///
-    /// This is local to the client and will not synchronize across
-    /// multiple clients.
-    ///
-    /// Default is 'None'
-    #[inline]
-    pub fn max_connections<V>(&mut self, val: V) -> &mut Self
-    where
-        V: Into<Option<usize>>,
-    {
-        self.max_connections = val.into();
         self
     }
 
@@ -808,6 +811,21 @@ impl Builder {
         B: Payload + Send,
         B::Data: Send,
     {
+        self.build_with_conns_counter(connector, None)
+    }
+
+    /// Combine the configuration of this builder with a connector to create a `Client`.
+    ///
+    /// Additionally, give a WeakCounter which will be synchronized with the client's
+    /// local counter of connections.
+    pub fn build_with_conns_counter<C, B>(&self, connector: C, conns_counter: Option<WeakCounter>) -> Client<C, B>
+    where
+        C: Connect,
+        C::Transport: 'static,
+        C::Future: 'static,
+        B: Payload + Send,
+        B::Data: Send,
+    {
         Client {
             connector: Arc::new(connector),
             executor: self.exec.clone(),
@@ -816,7 +834,7 @@ impl Builder {
             pool: Pool::new(
                 self.keep_alive,
                 self.keep_alive_timeout,
-                self.max_connections,
+                conns_counter,
                 &self.exec
             ),
             retry_canceled_requests: self.retry_canceled_requests,
