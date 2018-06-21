@@ -69,7 +69,7 @@ struct Connections<T> {
     conns_count: WeakCounter,
     // A list of evicted idle connections, kept until the connection is
     // officially closed
-    evicted_idle: Vec<Idle<T>>,
+    evicted_idle: Vec<(Idle<T>, Counter)>,
     // An optional maximum number of connections. HTTP/1 requests will
     // not create a new connection if this limit is reached, they will instead
     // wait to re-use a new idle connection or error if no idle connection will
@@ -92,6 +92,9 @@ struct Connections<T> {
     #[cfg(feature = "runtime")]
     exec: Exec,
     timeout: Option<Duration>,
+
+    idle_counter: WeakCounter,
+    evicted_idle_counter: WeakCounter,
 }
 
 // This is because `Weak::new()` *allocates* space for `T`, even if it
@@ -119,6 +122,9 @@ impl<T> Pool<T> {
                     #[cfg(feature = "runtime")]
                     exec: __exec.clone(),
                     timeout,
+
+                    idle_counter: WeakCounter::new(),
+                    evicted_idle_counter: WeakCounter::new(),
                 }),
                 enabled,
             }),
@@ -204,6 +210,9 @@ impl<T: Poolable> Pool<T> {
             Ver::Http1 => {
                 let can_connect_counter = {
                     let mut connections = self.inner.connections.lock().unwrap();
+                    // check if any in-progress evictions are finished
+                    connections.clear_evicted();
+
                     let mut can_connect = connections
                         .max_connections
                         .map(|max| connections.conns_count.count() < max)
@@ -215,6 +224,13 @@ impl<T: Poolable> Pool<T> {
                         let evicted = connections.evict_idle();
                         can_connect = evicted;
                     }
+
+                    error!(
+                        "QWERTY - Total Conns: {} | Idle Conns: {} | Evicted Idle Conns: {}",
+                        connections.conns_count.count(),
+                        connections.idle_counter.count(),
+                        connections.evicted_idle_counter.count(),
+                    );
 
                     if can_connect {
                         Some(connections.conns_count.spawn_upgrade())
@@ -398,6 +414,7 @@ impl<'a, T: Poolable + 'a> IdlePopper<'a, T> {
                         idle_at: Instant::now(),
                         value: to_reinsert,
                         counter: entry.counter,
+                        idle_counter: entry.idle_counter,
                     });
                     (to_checkout, None)
                 },
@@ -481,6 +498,7 @@ impl<T: Poolable> Connections<T> {
                          value: value,
                          idle_at: Instant::now(),
                          counter,
+                         idle_counter: self.idle_counter.spawn_upgrade(),
                      });
 
                 #[cfg(feature = "runtime")]
@@ -515,7 +533,7 @@ impl<T: Poolable> Connections<T> {
         if let Some(mut evicted) = evicted {
             evicted.value.close();
 
-            self.evicted_idle.push(evicted);
+            self.evicted_idle.push((evicted, self.evicted_idle_counter.spawn_upgrade()));
             true
         } else {
             false
@@ -615,8 +633,13 @@ impl<T: Poolable> Connections<T> {
             // returning false evicts this key/val
             !values.is_empty()
         });
+    }
 
-        self.evicted_idle.retain(|entry| {
+    fn clear_evicted(&mut self) {
+        let dur = self.timeout.expect("interval assumes timeout");
+        let now = Instant::now();
+
+        self.evicted_idle.retain(|(entry, _counter)| {
             if !entry.value.is_open() {
                 trace!("evicted idle closed");
                 return false;
@@ -628,7 +651,7 @@ impl<T: Poolable> Connections<T> {
             }
 
             true
-        })
+        });
     }
 }
 
@@ -725,6 +748,8 @@ struct Idle<T> {
     idle_at: Instant,
     value: T,
     counter: Counter,
+
+    idle_counter: Counter,
 }
 
 pub(super) struct Checkout<T> {
