@@ -331,6 +331,7 @@ impl<'a, T: Poolable + 'a> IdlePopper<'a, T> {
             // If the connection has been closed, or is older than our idle
             // timeout, simply drop it and keep looking...
             if !entry.value.is_open() {
+                error!("IdlePopper; remove closed conn | key: {:?}", self.key);
                 trace!("removing closed connection for {:?}", self.key);
                 continue;
             }
@@ -341,6 +342,7 @@ impl<'a, T: Poolable + 'a> IdlePopper<'a, T> {
             // In that case, we could just break out of the loop and drop the
             // whole list...
             if expiration.expires(entry.idle_at) {
+                error!("IdlePopper; remove expired conn | key: {:?}", self.key);
                 trace!("removing expired connection for {:?}", self.key);
                 continue;
             }
@@ -528,10 +530,12 @@ impl<T: Poolable> Connections<T> {
         self.idle.retain(|key, values| {
             values.retain(|entry| {
                 if !entry.value.is_open() {
+                    error!("clear_expired; remove closed conn | key: {:?}", key);
                     trace!("idle interval evicting closed for {:?}", key);
                     return false;
                 }
                 if now - entry.idle_at > dur {
+                    error!("clear_expired; remove expired conn | key: {:?}", key);
                     trace!("idle interval evicting expired for {:?}", key);
                     return false;
                 }
