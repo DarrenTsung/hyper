@@ -85,6 +85,7 @@ where
             // We just try to give the error to the user,
             // and close the connection with an Ok. If we
             // cannot give it to the user, then return the Err.
+            error!("conn closing: poll inner else - e: {:?}", e);
             self.dispatch.recv_msg(Err(e))?;
             Ok(Async::Ready(Dispatched::Shutdown))
         })
@@ -119,6 +120,7 @@ where
                 try_ready!(self.conn.shutdown().map_err(::Error::new_shutdown));
             }
             self.conn.take_error()?;
+            error!("conn closing: is done | log: {}", self.log_is_done());
             Ok(Async::Ready(Dispatched::Shutdown))
         } else {
             Ok(Async::NotReady)
@@ -142,7 +144,7 @@ where
                         Err(_canceled) => {
                             // user doesn't care about the body
                             // so we should stop reading
-                            trace!("body receiver dropped before eof, closing");
+                            error!("body receiver dropped before eof, closing");
                             self.conn.close_read();
                             return Ok(Async::Ready(()));
                         }
@@ -155,7 +157,7 @@ where
                                 },
                                 Err(_canceled) => {
                                     if self.conn.can_read_body() {
-                                        trace!("body receiver dropped before eof, closing");
+                                        error!("body receiver dropped before eof, closing");
                                         self.conn.close_read();
                                     }
                                 }
@@ -308,6 +310,7 @@ where
 
     fn close(&mut self) {
         self.is_closing = true;
+        error!("close_read as part of close()");
         self.conn.close_read();
         self.conn.close_write();
     }
@@ -326,6 +329,21 @@ where
             let write_done = self.conn.is_write_closed() ||
                 (!self.dispatch.should_poll() && self.body_rx.is_none());
             read_done && write_done
+        }
+    }
+
+    fn log_is_done(&self) -> &'static str {
+        if self.is_closing {
+            return "is_closing";
+        }
+
+        let read_done = self.conn.is_read_closed();
+
+        if !T::should_read_first() && read_done {
+            // a client that cannot read may was well be done.
+            "!should_read_first && read_done"
+        } else {
+            "read_done && write_done"
         }
     }
 }

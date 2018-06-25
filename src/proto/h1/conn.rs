@@ -168,11 +168,11 @@ where I: AsyncRead + AsyncWrite,
         let was_mid_parse = e.is_parse() || !self.io.read_buf().is_empty();
         if was_mid_parse || must_error {
             // We check if the buf contains the h2 Preface
-            debug!("parse error ({}) with {} bytes", e, self.io.read_buf().len());
+            error!("parse error ({}) with {} bytes", e, self.io.read_buf().len());
             self.on_parse_error(e)
                 .map(|()| Async::NotReady)
         } else {
-            debug!("read eof");
+            error!("read eof");
             Ok(Async::Ready(None))
         }
     }
@@ -196,6 +196,7 @@ where I: AsyncRead + AsyncWrite,
                             // this should actually be unreachable:
                             // the decoder will return an UnexpectedEof if there were
                             // no bytes to read and it isn't eof yet...
+                            error!("Error reading::Closed - decode stream unexpectedly ended");
                             (Reading::Closed, None)
                         };
                         (reading, Ok(Async::Ready(chunk)))
@@ -203,6 +204,7 @@ where I: AsyncRead + AsyncWrite,
                     Ok(Async::NotReady) => return Ok(Async::NotReady),
                     Err(e) => {
                         trace!("decode stream error: {}", e);
+                        error!("Error reading::Closed - {}", e);
                         (Reading::Closed, Err(e))
                     },
                 }
@@ -274,7 +276,7 @@ where I: AsyncRead + AsyncWrite,
     fn try_io_read(&mut self) -> Poll<usize, io::Error> {
          match self.io.read_from_io() {
             Ok(Async::Ready(0)) => {
-                trace!("try_io_read; found EOF on connection: {:?}", self.state);
+                error!("try_io_read; found EOF on connection: {:?}", self.state);
                 let must_error = self.should_error_on_eof();
                 let ret = if must_error {
                     let desc = if self.is_mid_message() {
@@ -298,7 +300,7 @@ where I: AsyncRead + AsyncWrite,
                 Ok(Async::NotReady)
             },
             Err(e) => {
-                trace!("try_io_read; error = {}", e);
+                error!("try_io_read; error = {}", e);
                 self.state.close();
                 Err(e)
             }
@@ -337,7 +339,7 @@ where I: AsyncRead + AsyncWrite,
                         return
                     },
                     Err(e) => {
-                        trace!("maybe_notify; read_from_io error: {}", e);
+                        error!("maybe_notify; read_from_io error: {}", e);
                         self.state.close();
                     }
                 }
@@ -762,7 +764,7 @@ impl State {
                 if let KA::Busy = self.keep_alive.status() {
                     self.idle();
                 } else {
-                    trace!("try_keep_alive({}): could keep-alive, but status = {:?}", T::LOG, self.keep_alive);
+                    error!("try_keep_alive({}): could keep-alive, but status = {:?}", T::LOG, self.keep_alive);
                     self.close();
                 }
             },
