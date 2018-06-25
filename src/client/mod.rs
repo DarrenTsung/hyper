@@ -77,6 +77,8 @@
 //! # fn main () {}
 //! ```
 
+use client::connect::Connected;
+use client::pool::Pooled;
 use std::fmt;
 use std::io;
 use std::sync::Arc;
@@ -275,12 +277,11 @@ where C: Connect + Sync + 'static,
         let url = req.uri().clone();
         let ver = self.ver;
         let pool_key = (Arc::new(domain.to_string()), self.ver);
+        let pool_key_clone = pool_key.clone();
         let checkout = self.pool.checkout(pool_key.clone());
+
         let connect = {
-            let executor = self.executor.clone();
             let pool = self.pool.clone();
-            let h1_writev = self.h1_writev;
-            let h1_title_case_headers = self.h1_title_case_headers;
             let connector = self.connector.clone();
             let dst = Destination {
                 uri: url,
@@ -290,67 +291,113 @@ where C: Connect + Sync + 'static,
                     Ok(connecting) => {
                         Either::A(connector.connect(dst)
                             .map_err(::Error::new_connect)
-                            .and_then(move |(io, connected)| {
-                                conn::Builder::new()
-                                    .exec(executor.clone())
-                                    .h1_writev(h1_writev)
-                                    .h1_title_case_headers(h1_title_case_headers)
-                                    .http2_only(pool_key.1 == Ver::Http2)
-                                    .handshake(io)
-                                    .and_then(move |(tx, conn)| {
-                                        let bg = executor.execute(conn.map_err(|e| {
-                                            debug!("client connection error: {}", e)
-                                        }));
+                            .map(|(io, connected)| (io, connected, connecting)))
+                        },
+                        Err(connecting_err) => {
+                            let canceled = ::Error::new_canceled(Some(connecting_err));
+                            Either::B(future::err(canceled))
+                        },
+                    }
+            })
+        };
 
-                                        // This task is critical, so an execute error
-                                        // should be returned.
-                                        if let Err(err) = bg {
-                                            warn!("error spawning critical client task: {}", err);
-                                            return Either::A(future::err(err));
+        // checkout -> Future<Item=Pooled<T>, Error=Error>
+        // connect -> Future<Item=(T, ..), Error=Error>
+        //
+        // In order to prevent connection thrash due to connections
+        // being dropped after being established, we only allow the checkout
+        // future to beat the connect future if it finishes before
+        // a connection is established.
+        let race = {
+            let executor = self.executor.clone();
+            let pool = self.pool.clone();
+            let h1_writev = self.h1_writev;
+            let h1_title_case_headers = self.h1_title_case_headers;
+
+            let connect2pooled = move |(io, connected, connecting): (<C as Connect>::Transport, Connected, _)| {
+                conn::Builder::new()
+                .exec(executor.clone())
+                .h1_writev(h1_writev)
+                .h1_title_case_headers(h1_title_case_headers)
+                .http2_only(pool_key_clone.1 == Ver::Http2)
+                .handshake(io)
+                .and_then(move |(tx, conn)| {
+                    let bg = executor.execute(conn.map_err(|e| {
+                        debug!("client connection error: {}", e)
+                    }));
+
+                    // This task is critical, so an execute error
+                    // should be returned.
+                    if let Err(err) = bg {
+                        warn!("error spawning critical client task: {}", err);
+                        return Either::B(future::err(err))
+                    }
+
+                    // Wait for 'conn' to ready up before we
+                    // declare this tx as usable
+                    Either::A(tx.when_ready())
+                })
+                .map(move |tx| {
+                    pool.pooled(connecting, PoolClient {
+                        is_proxied: connected.is_proxied,
+                        tx: match ver {
+                            Ver::Http1 => PoolTx::Http1(tx),
+                            Ver::Http2 => PoolTx::Http2(tx.into_http2()),
+                        },
+                    })
+                })
+            };
+
+            checkout.select2(connect)
+                .then(move |res| {
+                    match res {
+                        // Either checkout or connect could get canceled:
+                        //
+                        // 1. Connect is canceled if this is HTTP/2 and there is
+                        //    an outstanding HTTP/2 connecting task OR this is HTTP/1
+                        //    and there are too many connections.
+                        // 2. Checkout is canceled if the pool cannot deliver an
+                        //    idle connection reliably.
+                        //
+                        // In both cases, we should just wait for the other future.
+                        Err(Either::A((e, connect))) => {
+                            if e.is_canceled() {
+                                Either::A(PooledFuture::CheckoutErr(
+                                    connect
+                                        .and_then(connect2pooled)
+                                        .map_err(ClientError::Normal)
+                                ))
+                            } else {
+                                Either::B(future::err(ClientError::Normal(e)))
+                            }
+                        }
+                        Err(Either::B((e, checkout))) => {
+                            if e.is_canceled() {
+                                Either::A(PooledFuture::ConnectErr(checkout.map_err(ClientError::Normal)))
+                            } else {
+                                Either::B(future::err(ClientError::Normal(e)))
+                            }
+                        },
+                        Ok(Either::A((pooled, _connect))) => {
+                            Either::A(PooledFuture::CheckoutFin(future::lazy(move || {
+                                future::ok::<Pooled<_>, ClientError<_>>(pooled)
+                            })))
+                        },
+                        Ok(Either::B((connect_res, checkout))) => {
+                            Either::A(PooledFuture::ConnectFin(
+                                connect2pooled(connect_res)
+                                    .or_else(move |e| {
+                                        if e.is_canceled() {
+                                            Either::A(checkout.map_err(ClientError::Normal))
+                                        } else {
+                                            Either::B(future::err(ClientError::Normal(e)))
                                         }
-
-                                        // Wait for 'conn' to ready up before we
-                                        // declare this tx as usable
-                                        Either::B(tx.when_ready())
                                     })
-                                    .map(move |tx| {
-                                        pool.pooled(connecting, PoolClient {
-                                            is_proxied: connected.is_proxied,
-                                            tx: match ver {
-                                                Ver::Http1 => PoolTx::Http1(tx),
-                                                Ver::Http2 => PoolTx::Http2(tx.into_http2()),
-                                            },
-                                        })
-                                    })
-                            }))
-                    },
-                    Err(connecting_err) => {
-                        let canceled = ::Error::new_canceled(Some(connecting_err));
-                        Either::B(future::err(canceled))
+                            ))
                     },
                 }
             })
         };
-
-        let race = checkout.select(connect)
-            .map(|(pooled, _work)| pooled)
-            .or_else(|(e, other)| {
-                // Either checkout or connect could get canceled:
-                //
-                // 1. Connect is canceled if this is HTTP/2 and there is
-                //    an outstanding HTTP/2 connecting task OR this is HTTP/1
-                //    and there are too many connections.
-                // 2. Checkout is canceled if the pool cannot deliver an
-                //    idle connection reliably.
-                //
-                // In both cases, we should just wait for the other future.
-                if e.is_canceled() {
-                    //trace!("checkout/connect race canceled: {}", e);
-                    Either::A(other.map_err(ClientError::Normal))
-                } else {
-                    Either::B(future::err(ClientError::Normal(e)))
-                }
-            });
 
         let executor = self.executor.clone();
         let resp = race.and_then(move |mut pooled| {
@@ -445,6 +492,33 @@ where C: Connect + Sync + 'static,
         });
 
         Box::new(resp)
+    }
+}
+
+enum PooledFuture<A, B, C, D> {
+    CheckoutFin(A),
+    ConnectFin(B),
+    CheckoutErr(C),
+    ConnectErr(D),
+}
+
+impl<A, B, C, D> Future for PooledFuture<A, B, C, D>
+where
+    A: Future,
+    B: Future<Item=A::Item, Error=A::Error>,
+    C: Future<Item=A::Item, Error=A::Error>,
+    D: Future<Item=A::Item, Error=A::Error>,
+{
+    type Item = A::Item;
+    type Error = A::Error;
+
+    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+        match self {
+            PooledFuture::CheckoutFin(a) => a.poll(),
+            PooledFuture::ConnectFin(b) => b.poll(),
+            PooledFuture::CheckoutErr(c) => c.poll(),
+            PooledFuture::ConnectErr(d) => d.poll(),
+        }
     }
 }
 
