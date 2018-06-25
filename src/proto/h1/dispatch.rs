@@ -189,6 +189,7 @@ where
             Ok(Async::NotReady) => unreachable!("dispatch not ready when conn is"),
             Err(()) => {
                 trace!("dispatch no longer receiving messages");
+                error!("conn close - 1 - no longer receiving messages");
                 self.close();
                 return Ok(Async::Ready(()));
             }
@@ -441,6 +442,7 @@ where
                 match cb.poll_cancel().expect("poll_cancel cannot error") {
                     Async::Ready(()) => {
                         trace!("request canceled");
+                        error!("conn close - 2B - poll_msg none - request canceled");
                         Ok(Async::Ready(None))
                     },
                     Async::NotReady => {
@@ -458,6 +460,8 @@ where
             Ok(Async::Ready(None)) => {
                 trace!("client tx closed");
                 // user has dropped sender handle
+
+                error!("conn close - 2A - poll_msg none - client tx closed");
                 Ok(Async::Ready(None))
             },
             Ok(Async::NotReady) => return Ok(Async::NotReady),
