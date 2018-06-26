@@ -429,7 +429,7 @@ impl<T: Poolable> Connections<T> {
 
         match (value, counter) {
             (Some(value), Some(counter)) => {
-                error!("pooling idle connection for {:?}", key);
+                trace!("pooling idle connection for {:?}", key);
                 self.idle.entry(key)
                      .or_insert(Vec::new())
                      .push(Idle {
