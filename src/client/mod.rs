@@ -78,7 +78,6 @@
 //! ```
 
 use client::connect::Connected;
-use client::pool::Pooled;
 use std::fmt;
 use std::io;
 use std::sync::Arc;
@@ -348,49 +347,17 @@ where C: Connect + Sync + 'static,
                 })
             };
 
-            checkout.select2(connect)
-                .then(move |res| {
-                    match res {
-                        // Either checkout or connect could get canceled:
-                        //
-                        // 1. Connect is canceled if this is HTTP/2 and there is
-                        //    an outstanding HTTP/2 connecting task OR this is HTTP/1
-                        //    and there are too many connections.
-                        // 2. Checkout is canceled if the pool cannot deliver an
-                        //    idle connection reliably.
-                        //
-                        // In both cases, we should just wait for the other future.
-                        Err(Either::A((e, connect))) => {
-                            if e.is_canceled() {
-                                Either::A(PooledFuture::CheckoutErr(
-                                    connect
-                                        .and_then(connect2pooled)
-                                        .map_err(ClientError::Normal)
-                                ))
-                            } else {
-                                Either::B(future::err(ClientError::Normal(e)))
-                            }
-                        }
-                        Err(Either::B((e, checkout))) => {
-                            if e.is_canceled() {
-                                Either::A(PooledFuture::ConnectErr(checkout.map_err(ClientError::Normal)))
-                            } else {
-                                Either::B(future::err(ClientError::Normal(e)))
-                            }
-                        },
-                        Ok(Either::A((pooled, _connect))) => {
-                            Either::A(PooledFuture::CheckoutFin(future::lazy(move || {
-                                future::ok::<Pooled<_>, ClientError<_>>(pooled)
-                            })))
-                        },
-                        Ok(Either::B((connect_res, _checkout))) => {
-                            Either::A(PooledFuture::ConnectFin(
-                                connect2pooled(connect_res)
-                                    .map_err(ClientError::Normal)
-                            ))
-                    },
-                }
-            })
+            checkout
+                .map_err(ClientError::Normal)
+                .and_then(move |pooled| {
+                    if let Some(pooled) = pooled {
+                        Either::A(future::lazy(move || {
+                            future::ok::<_, ClientError<_>>(pooled)
+                        }))
+                    } else {
+                        Either::B(connect.and_then(connect2pooled).map_err(ClientError::Normal))
+                    }
+                })
         };
 
         let executor = self.executor.clone();
@@ -486,33 +453,6 @@ where C: Connect + Sync + 'static,
         });
 
         Box::new(resp)
-    }
-}
-
-enum PooledFuture<A, B, C, D> {
-    CheckoutFin(A),
-    ConnectFin(B),
-    CheckoutErr(C),
-    ConnectErr(D),
-}
-
-impl<A, B, C, D> Future for PooledFuture<A, B, C, D>
-where
-    A: Future,
-    B: Future<Item=A::Item, Error=A::Error>,
-    C: Future<Item=A::Item, Error=A::Error>,
-    D: Future<Item=A::Item, Error=A::Error>,
-{
-    type Item = A::Item;
-    type Error = A::Error;
-
-    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
-        match self {
-            PooledFuture::CheckoutFin(a) => a.poll(),
-            PooledFuture::ConnectFin(b) => b.poll(),
-            PooledFuture::CheckoutErr(c) => c.poll(),
-            PooledFuture::ConnectErr(d) => d.poll(),
-        }
     }
 }
 

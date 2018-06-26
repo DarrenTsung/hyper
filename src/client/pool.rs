@@ -310,13 +310,13 @@ impl<T: Poolable> Pool<T> {
         }
     }
 
-    fn waiter(&mut self, key: Key, tx: oneshot::Sender<(T, Option<Counter>)>) {
-        trace!("checkout waiting for idle connection: {:?}", key);
-        self.inner.connections.lock().unwrap()
-            .waiters.entry(key)
-            .or_insert(VecDeque::new())
-            .push_back(tx);
-    }
+    // fn waiter(&mut self, key: Key, tx: oneshot::Sender<(T, Option<Counter>)>) {
+    //     trace!("checkout waiting for idle connection: {:?}", key);
+    //     self.inner.connections.lock().unwrap()
+    //         .waiters.entry(key)
+    //         .or_insert(VecDeque::new())
+    //         .push_back(tx);
+    // }
 }
 
 /// Pop off this list, looking for a usable connection that hasn't expired.
@@ -652,54 +652,55 @@ pub(super) struct Checkout<T> {
 }
 
 impl<T: Poolable> Checkout<T> {
-    fn poll_waiter(&mut self) -> Poll<Option<Pooled<T>>, ::Error> {
-        static CANCELED: &str = "pool checkout failed";
-        if let Some(mut rx) = self.waiter.take() {
-            match rx.poll() {
-                Ok(Async::Ready((value, counter))) => {
-                    if value.is_open() {
-                        Ok(Async::Ready(Some(self.pool.reuse(&self.key, value, counter))))
-                    } else {
-                        Err(::Error::new_canceled(Some(CANCELED)))
-                    }
-                },
-                Ok(Async::NotReady) => {
-                    self.waiter = Some(rx);
-                    Ok(Async::NotReady)
-                },
-                Err(_canceled) => Err(::Error::new_canceled(Some(CANCELED))),
-            }
-        } else {
-            Ok(Async::Ready(None))
-        }
-    }
-
-    fn add_waiter(&mut self) {
-        if self.waiter.is_none() {
-            let (tx, mut rx) = oneshot::channel();
-            let _ = rx.poll(); // park this task
-            self.pool.waiter(self.key.clone(), tx);
-            self.waiter = Some(rx);
-        }
-    }
+    // fn poll_waiter(&mut self) -> Poll<Option<Pooled<T>>, ::Error> {
+    //     static CANCELED: &str = "pool checkout failed";
+    //     if let Some(mut rx) = self.waiter.take() {
+    //         match rx.poll() {
+    //             Ok(Async::Ready((value, counter))) => {
+    //                 if value.is_open() {
+    //                     Ok(Async::Ready(Some(self.pool.reuse(&self.key, value, counter))))
+    //                 } else {
+    //                     Err(::Error::new_canceled(Some(CANCELED)))
+    //                 }
+    //             },
+    //             Ok(Async::NotReady) => {
+    //                 self.waiter = Some(rx);
+    //                 Ok(Async::NotReady)
+    //             },
+    //             Err(_canceled) => Err(::Error::new_canceled(Some(CANCELED))),
+    //         }
+    //     } else {
+    //         Ok(Async::Ready(None))
+    //     }
+    // }
+    //
+    // fn add_waiter(&mut self) {
+    //     if self.waiter.is_none() {
+    //         let (tx, mut rx) = oneshot::channel();
+    //         let _ = rx.poll(); // park this task
+    //         self.pool.waiter(self.key.clone(), tx);
+    //         self.waiter = Some(rx);
+    //     }
+    // }
 }
 
 impl<T: Poolable> Future for Checkout<T> {
-    type Item = Pooled<T>;
+    type Item = Option<Pooled<T>>;
     type Error = ::Error;
 
     fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
-        if let Some(pooled) = try_ready!(self.poll_waiter()) {
-            return Ok(Async::Ready(pooled));
-        }
+        // if let Some(pooled) = try_ready!(self.poll_waiter()) {
+        //     return Ok(Async::Ready(pooled));
+        // }
 
         let entry = self.pool.take(&self.key);
 
         if let Some(pooled) = entry {
-            Ok(Async::Ready(pooled))
+            Ok(Async::Ready(Some(pooled)))
         } else {
-            self.add_waiter();
-            Ok(Async::NotReady)
+            Ok(Async::Ready(None))
+            // self.add_waiter();
+            // Ok(Async::NotReady)
         }
     }
 }
@@ -860,7 +861,7 @@ mod tests {
         drop(pooled);
 
         match pool.checkout(key).poll().unwrap() {
-            Async::Ready(pooled) => assert_eq!(*pooled, Uniq(41)),
+            Async::Ready(pooled) => assert_eq!(*pooled.unwrap(), Uniq(41)),
             _ => panic!("not ready"),
         }
     }
@@ -944,7 +945,7 @@ mod tests {
             drop(pooled);
             Ok(())
         })).map(|(entry, _)| entry);
-        assert_eq!(*checkout.wait().unwrap(), Uniq(41));
+        assert_eq!(*checkout.wait().unwrap().unwrap(), Uniq(41));
     }
 
     #[test]
