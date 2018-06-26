@@ -383,16 +383,10 @@ where C: Connect + Sync + 'static,
                                 future::ok::<Pooled<_>, ClientError<_>>(pooled)
                             })))
                         },
-                        Ok(Either::B((connect_res, checkout))) => {
+                        Ok(Either::B((connect_res, _checkout))) => {
                             Either::A(PooledFuture::ConnectFin(
                                 connect2pooled(connect_res)
-                                    .or_else(move |e| {
-                                        if e.is_canceled() {
-                                            Either::A(checkout.map_err(ClientError::Normal))
-                                        } else {
-                                            Either::B(future::err(ClientError::Normal(e)))
-                                        }
-                                    })
+                                    .map_err(ClientError::Normal)
                             ))
                     },
                 }
