@@ -310,13 +310,13 @@ impl<T: Poolable> Pool<T> {
         }
     }
 
-    fn waiter(&mut self, key: Key, tx: oneshot::Sender<(T, Option<Counter>)>) {
-        trace!("checkout waiting for idle connection: {:?}", key);
-        self.inner.connections.lock().unwrap()
-            .waiters.entry(key)
-            .or_insert(VecDeque::new())
-            .push_back(tx);
-    }
+    // fn waiter(&mut self, key: Key, tx: oneshot::Sender<(T, Option<Counter>)>) {
+    //     trace!("checkout waiting for idle connection: {:?}", key);
+    //     self.inner.connections.lock().unwrap()
+    //         .waiters.entry(key)
+    //         .or_insert(VecDeque::new())
+    //         .push_back(tx);
+    // }
 }
 
 /// Pop off this list, looking for a usable connection that hasn't expired.
@@ -652,36 +652,36 @@ pub(super) struct Checkout<T> {
 }
 
 impl<T: Poolable> Checkout<T> {
-    fn poll_waiter(&mut self) -> Poll<Option<Pooled<T>>, ::Error> {
-        static CANCELED: &str = "pool checkout failed";
-        if let Some(mut rx) = self.waiter.take() {
-            match rx.poll() {
-                Ok(Async::Ready((value, counter))) => {
-                    if value.is_open() {
-                        Ok(Async::Ready(Some(self.pool.reuse(&self.key, value, counter))))
-                    } else {
-                        Err(::Error::new_canceled(Some(CANCELED)))
-                    }
-                },
-                Ok(Async::NotReady) => {
-                    self.waiter = Some(rx);
-                    Ok(Async::NotReady)
-                },
-                Err(_canceled) => Err(::Error::new_canceled(Some(CANCELED))),
-            }
-        } else {
-            Ok(Async::Ready(None))
-        }
-    }
+    // fn poll_waiter(&mut self) -> Poll<Option<Pooled<T>>, ::Error> {
+    //     static CANCELED: &str = "pool checkout failed";
+    //     if let Some(mut rx) = self.waiter.take() {
+    //         match rx.poll() {
+    //             Ok(Async::Ready((value, counter))) => {
+    //                 if value.is_open() {
+    //                     Ok(Async::Ready(Some(self.pool.reuse(&self.key, value, counter))))
+    //                 } else {
+    //                     Err(::Error::new_canceled(Some(CANCELED)))
+    //                 }
+    //             },
+    //             Ok(Async::NotReady) => {
+    //                 self.waiter = Some(rx);
+    //                 Ok(Async::NotReady)
+    //             },
+    //             Err(_canceled) => Err(::Error::new_canceled(Some(CANCELED))),
+    //         }
+    //     } else {
+    //         Ok(Async::Ready(None))
+    //     }
+    // }
 
-    fn add_waiter(&mut self) {
-        if self.waiter.is_none() {
-            let (tx, mut rx) = oneshot::channel();
-            let _ = rx.poll(); // park this task
-            self.pool.waiter(self.key.clone(), tx);
-            self.waiter = Some(rx);
-        }
-    }
+    // fn add_waiter(&mut self) {
+    //     if self.waiter.is_none() {
+    //         let (tx, mut rx) = oneshot::channel();
+    //         let _ = rx.poll(); // park this task
+    //         self.pool.waiter(self.key.clone(), tx);
+    //         self.waiter = Some(rx);
+    //     }
+    // }
 }
 
 impl<T: Poolable> Future for Checkout<T> {
@@ -689,16 +689,16 @@ impl<T: Poolable> Future for Checkout<T> {
     type Error = ::Error;
 
     fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
-        if let Some(pooled) = try_ready!(self.poll_waiter()) {
-            return Ok(Async::Ready(pooled));
-        }
+        // if let Some(pooled) = try_ready!(self.poll_waiter()) {
+        //     return Ok(Async::Ready(pooled));
+        // }
 
         let entry = self.pool.take(&self.key);
 
         if let Some(pooled) = entry {
             Ok(Async::Ready(pooled))
         } else {
-            self.add_waiter();
+            // self.add_waiter();
             Ok(Async::NotReady)
         }
     }
