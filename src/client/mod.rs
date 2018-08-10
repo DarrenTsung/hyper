@@ -113,6 +113,7 @@ pub struct Client<C, B = Body> {
     h1_title_case_headers: bool,
     pool: Pool<PoolClient<B>>,
     retry_canceled_requests: bool,
+    max_use_count: Option<usize>,
     set_host: bool,
     ver: Ver,
 }
@@ -272,6 +273,7 @@ where C: Connect + Sync + 'static,
             let h1_writev = self.h1_writev;
             let h1_title_case_headers = self.h1_title_case_headers;
             let connector = self.connector.clone();
+            let max_use_count = self.max_use_count;
             let dst = Destination {
                 uri: url,
             };
@@ -309,6 +311,8 @@ where C: Connect + Sync + 'static,
                                             Ver::Http1 => PoolTx::Http1(tx),
                                             Ver::Http2 => PoolTx::Http2(tx.into_http2()),
                                         },
+                                        max_use_count,
+                                        use_count: 0,
                                     })
                                 })
                         }))
@@ -382,6 +386,9 @@ where C: Connect + Sync + 'static,
 
         let executor = self.executor.clone();
         let resp = race.and_then(move |mut pooled| {
+            // this connection is being used now, so increment use count
+            pooled.incr_use_count();
+
             let conn_reused = pooled.is_reused();
             if ver == Ver::Http1 {
                 // CONNECT always sends origin-form, so check it first...
@@ -498,6 +505,7 @@ impl<C, B> Clone for Client<C, B> {
             h1_title_case_headers: self.h1_title_case_headers,
             pool: self.pool.clone(),
             retry_canceled_requests: self.retry_canceled_requests,
+            max_use_count: self.max_use_count,
             set_host: self.set_host,
             ver: self.ver,
         }
@@ -586,6 +594,9 @@ where
 struct PoolClient<B> {
     is_proxied: bool,
     tx: PoolTx<B>,
+
+    max_use_count: Option<usize>,
+    use_count: usize,
 }
 
 enum PoolTx<B> {
@@ -601,7 +612,15 @@ impl<B> PoolClient<B> {
         }
     }
 
+    fn incr_use_count(&mut self) {
+        self.use_count += 1;
+    }
+
     fn is_ready(&self) -> bool {
+        if self.is_over_max_use_count() {
+            return false;
+        }
+
         match self.tx {
             PoolTx::Http1(ref tx) => tx.is_ready(),
             PoolTx::Http2(ref tx) => tx.is_ready(),
@@ -609,10 +628,20 @@ impl<B> PoolClient<B> {
     }
 
     fn is_closed(&self) -> bool {
+        if self.is_over_max_use_count() {
+            return true;
+        }
+
         match self.tx {
             PoolTx::Http1(ref tx) => tx.is_closed(),
             PoolTx::Http2(ref tx) => tx.is_closed(),
         }
+    }
+
+    fn is_over_max_use_count(&self) -> bool {
+        self.max_use_count
+            .map(|c| self.use_count > c)
+            .unwrap_or(false)
     }
 }
 
@@ -634,6 +663,10 @@ where
     B: Send + 'static,
 {
     fn is_open(&self) -> bool {
+        if self.is_over_max_use_count() {
+            return false;
+        }
+
         match self.tx {
             PoolTx::Http1(ref tx) => tx.is_ready(),
             PoolTx::Http2(ref tx) => tx.is_ready(),
@@ -646,16 +679,22 @@ where
                 Reservation::Unique(PoolClient {
                     is_proxied: self.is_proxied,
                     tx: PoolTx::Http1(tx),
+                    max_use_count: self.max_use_count,
+                    use_count: self.use_count,
                 })
             },
             PoolTx::Http2(tx) => {
                 let b = PoolClient {
                     is_proxied: self.is_proxied,
                     tx: PoolTx::Http2(tx.clone()),
+                    max_use_count: self.max_use_count,
+                    use_count: self.use_count,
                 };
                 let a = PoolClient {
                     is_proxied: self.is_proxied,
                     tx: PoolTx::Http2(tx),
+                    max_use_count: self.max_use_count,
+                    use_count: self.use_count,
                 };
                 Reservation::Shared(a, b)
             }
@@ -746,6 +785,7 @@ pub struct Builder {
     exec: Exec,
     keep_alive: bool,
     keep_alive_timeout: Option<Duration>,
+    max_use_count: Option<usize>,
     h1_writev: bool,
     h1_title_case_headers: bool,
     //TODO: make use of max_idle config
@@ -761,6 +801,7 @@ impl Default for Builder {
             exec: Exec::Default,
             keep_alive: true,
             keep_alive_timeout: Some(Duration::from_secs(90)),
+            max_use_count: None,
             h1_writev: true,
             h1_title_case_headers: false,
             max_idle: 5,
@@ -792,6 +833,19 @@ impl Builder {
         D: Into<Option<Duration>>,
     {
         self.keep_alive_timeout = val.into();
+        self
+    }
+
+    /// Set an optional maximum use count for re-used connections.
+    /// Does nothing if keep-alive is disabled.
+    ///
+    /// Default is None
+    #[inline]
+    pub fn max_use_count<V>(&mut self, val: V) -> &mut Self
+    where
+        V: Into<Option<usize>>,
+    {
+        self.max_use_count = val.into();
         self
     }
 
@@ -903,6 +957,7 @@ impl Builder {
             pool: Pool::new(self.keep_alive, self.keep_alive_timeout, &self.exec),
             retry_canceled_requests: self.retry_canceled_requests,
             set_host: self.set_host,
+            max_use_count: self.max_use_count,
             ver: self.ver,
         }
     }
